@@ -1433,6 +1433,17 @@ let SESSION = null;
 let CODES_AT = 0;
 const NameCtx = React.createContext({ mayu: "Mayu", bran: "Bran", title: "Bistro 309" });
 const useNames = () => React.useContext(NameCtx);
+const MeCtx = React.createContext(null);
+const useMe = () => React.useContext(MeCtx);
+const nameOf = (p) => {
+  const n = String(p && p.name || "").trim();
+  return /^guests?$/i.test(n) ? "" : n;
+};
+const personOf = (p) => p && p.id ? { id: p.id, name: p.name || "", role: p.role || "" } : null;
+const fromLabel = (r, names) => {
+  const n = String(r.guestName || r.by || "").trim();
+  return r.from === "guest" ? n ? `Guest \xB7 ${n}` : "Guest" : r.by || names.bran;
+};
 const SyncCtx = React.createContext(null);
 const SYNC = { state: "idle", error: "", at: 0, listeners: /* @__PURE__ */ new Set() };
 const setSync = (patch) => {
@@ -1457,7 +1468,7 @@ function useSync() {
   }, []);
   return SYNC;
 }
-const rpc = async (fn, args, c = cfg()) => {
+const rpc = async (fn, args, c = cfg(), keep) => {
   if (!c) return { ok: false, kind: "config", error: "Not connected." };
   const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
   const timer = ctl ? setTimeout(() => ctl.abort(), 12e3) : null;
@@ -1465,7 +1476,9 @@ const rpc = async (fn, args, c = cfg()) => {
     const r = await fetch(`${c.url}/rest/v1/rpc/${fn}`, {
       method: "POST",
       cache: "no-store",
-      signal: ctl ? ctl.signal : void 0,
+      signal: ctl && !keep ? ctl.signal : void 0,
+      keepalive: !!keep,
+      // a request sent as the page closes must outlive it
       /* Supabase's newer "publishable" keys go in the apikey header only; its older "anon" keys (long ones starting eyJ) are also sent as a bearer token */
       headers: { apikey: c.key, .../^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(c.key) ? { Authorization: `Bearer ${c.key}` } : {}, "Content-Type": "application/json" },
       body: JSON.stringify(args)
@@ -1560,6 +1573,102 @@ const store = {
     const r = await rpc("bistro_set_passwords", { p_code: cfg().kitchen, p_pass: pass || SESSION.pass, p_new: next });
     return r.ok ? r.value : { ok: false, reason: r.error };
   }
+};
+const people = {
+  list: async () => {
+    const r = await rpc("bistro_people_list", { p_code: cfg().kitchen, p_pass: SESSION.pass });
+    return r.ok ? r.value || {} : { ok: false, kind: r.kind, error: r.error };
+  },
+  save: async (p) => {
+    const r = await rpc("bistro_person_save", { p_code: cfg().kitchen, p_pass: SESSION.pass, p_person: p });
+    return r.ok ? r.value || {} : { ok: false, kind: r.kind, reason: r.error };
+  },
+  remove: async (id) => {
+    const r = await rpc("bistro_person_delete", { p_code: cfg().kitchen, p_pass: SESSION.pass, p_id: id });
+    return r.ok ? r.value || {} : { ok: false, reason: r.error };
+  },
+  usage: async (id) => {
+    let tz = "America/Toronto";
+    try {
+      tz = Intl.DateTimeFormat().resolvedOptions().timeZone || tz;
+    } catch {
+    }
+    const r = await rpc("bistro_person_usage", { p_code: cfg().kitchen, p_pass: SESSION.pass, p_id: id, p_tz: tz });
+    return r.ok ? r.value || {} : { ok: false, reason: r.error };
+  }
+};
+const TRACK = { q: [], sid: "", hiddenAt: 0, off: false, sending: false, closed: false };
+const deviceName = () => {
+  try {
+    const u = navigator.userAgent || "";
+    const os = /iPhone/.test(u) ? "iPhone" : /iPad/.test(u) || /Macintosh/.test(u) && navigator.maxTouchPoints > 1 ? "iPad" : /Android/.test(u) ? "Android" : /Mac OS X/.test(u) ? "Mac" : /Windows/.test(u) ? "Windows" : /CrOS/.test(u) ? "Chromebook" : /Linux/.test(u) ? "Linux" : "a device";
+    const br = /Edg\//.test(u) ? "Edge" : /OPR\//.test(u) ? "Opera" : /SamsungBrowser/.test(u) ? "Samsung Internet" : /CriOS|Chrome\//.test(u) ? "Chrome" : /FxiOS|Firefox\//.test(u) ? "Firefox" : /Safari\//.test(u) ? "Safari" : "";
+    return br ? `${os} \xB7 ${br}` : os;
+  } catch {
+    return "";
+  }
+};
+const tracking = () => !TRACK.off && !DEMO && !!SESSION && SESSION.who !== "mayu" && store.cloud();
+const VISIT_KEY = "bistro-visit";
+const visitTag = () => {
+  let h = 5381;
+  const t = SESSION ? SESSION.who + ":" + SESSION.pass : "";
+  for (let i = 0; i < t.length; i++) h = (h << 5) + h + t.charCodeAt(i) | 0;
+  return String(h);
+};
+const keepVisit = () => {
+  try {
+    TRACK.sid ? sessionStorage.setItem(VISIT_KEY, JSON.stringify({ sid: TRACK.sid, at: Date.now(), tag: visitTag() })) : sessionStorage.removeItem(VISIT_KEY);
+  } catch {
+  }
+};
+function track(e, d) {
+  if (!tracking()) return;
+  const t = (/* @__PURE__ */ new Date()).toISOString();
+  if (!TRACK.sid) {
+    let prev = null;
+    try {
+      prev = JSON.parse(sessionStorage.getItem(VISIT_KEY) || "null");
+    } catch {
+    }
+    TRACK.closed = false;
+    if (e !== "open" && prev && prev.sid && prev.tag === visitTag() && Date.now() - prev.at < 20 * 6e4) {
+      TRACK.sid = prev.sid;
+      TRACK.q.push({ e: "back", t, s: TRACK.sid, dev: deviceName() });
+    } else {
+      TRACK.sid = uid() + uid();
+      TRACK.q.push({ e: "open", t, s: TRACK.sid, dev: deviceName(), d: { w: window.innerWidth, h: window.innerHeight } });
+    }
+    setTimeout(() => sendTrack(), 60);
+  }
+  if (e !== "open") TRACK.q.push({ e, d: d || void 0, t, s: TRACK.sid });
+  keepVisit();
+  if (TRACK.q.length >= 12) sendTrack();
+}
+async function sendTrack(keep) {
+  if (!TRACK.q.length || TRACK.sending && !keep || !SESSION || SESSION.who === "mayu" || !store.cloud()) return;
+  TRACK.sending = true;
+  const batch = TRACK.q.splice(0, 60), pass = SESSION.pass, sid = TRACK.sid;
+  try {
+    const r = await rpc("bistro_track", { p_code: cfg().kitchen, p_pass: pass, p_session: sid, p_events: batch }, cfg(), keep);
+    if (!r.ok) {
+      if (r.kind === "setup") {
+        TRACK.off = true;
+        TRACK.q.length = 0;
+      } else if (r.kind === "offline" || r.kind === "server") TRACK.q.unshift(...batch.slice(-40));
+    }
+  } finally {
+    TRACK.sending = false;
+  }
+}
+const trackEnd = () => {
+  if (TRACK.sid && tracking()) {
+    if (!TRACK.closed) TRACK.q.push({ e: "close", t: (/* @__PURE__ */ new Date()).toISOString(), s: TRACK.sid });
+    sendTrack(true);
+  }
+  TRACK.sid = "";
+  TRACK.closed = false;
+  keepVisit();
 };
 const LIST_KEYS = ["requests", "cravings", "history", "grocery", "plants"];
 const SHARED_KEYS = ["catTreat", "dogTreat", "dogTreats", "arcade"];
@@ -2383,6 +2492,14 @@ input:focus, textarea:focus, select:focus{ border-color:#C49A44 !important; box-
 .bb-mote{ animation:bb-mote var(--t,9s) ease-in-out infinite }
 @keyframes bb-tick-tock{ 0%,100%{transform:rotate(0)} 50%{transform:rotate(-11deg)} }
 .bb-ticker{ transform-origin:50% 8%; animation:bb-tick-tock .13s linear infinite }
+/* the People page */
+@keyframes bb-bar-grow{ from{transform:scaleY(0)} to{transform:none} }
+.bb-bar-grow{ animation:bb-bar-grow .7s var(--spring) backwards }
+.bb-person{ transition:transform .2s var(--out), box-shadow .2s ease, border-color .2s ease }
+.bb-person:hover{ transform:translate3d(0,-2px,0); box-shadow:0 8px 20px rgba(70,48,42,0.12); border-color:#DCC3AC }
+.bb-person:active{ transform:scale(.99) }
+@keyframes bb-here{ 0%{box-shadow:0 0 0 0 rgba(110,130,89,.55)} 100%{box-shadow:0 0 0 6px rgba(110,130,89,0)} }
+.bb-here{ display:inline-block; width:8px; height:8px; border-radius:4px; background:${C.sageDeep}; margin-right:6px; vertical-align:1px; animation:bb-here 1.6s ease-out infinite }
 @media (prefers-reduced-motion: reduce){ *, *::before, *::after{ animation-duration:.001ms !important; animation-delay:0s !important; animation-iteration-count:1 !important; transition-duration:.001ms !important } }
 .bb-scroll::-webkit-scrollbar{ height:6px } .bb-scroll::-webkit-scrollbar-thumb{ background:${C.line}; border-radius:3px }
 input, textarea, select, button { font-family: ${F}; }
@@ -2741,6 +2858,7 @@ function GroceryList({ data, update, who }) {
     const txt = (t ?? text).trim();
     if (!txt) return;
     set((g) => [...g, { id: uid(), text: txt, note: (n ?? note).trim(), got: null, addedBy: who, forRecipe: forRecipe || null, updatedAt: Date.now() }]);
+    if (who !== "mayu") track("grocery", { text: txt.slice(0, 80) });
     setText("");
     setNote("");
     setAdding(false);
@@ -3559,6 +3677,18 @@ function App() {
   const [notice, setNotice] = useState("");
   const [pub, setPub] = useState(() => savedPublic());
   const [home, setHome] = useState(() => savedHome());
+  const [me, setMe] = useState(null);
+  const meRef = useRef(null);
+  meRef.current = me;
+  const noteMe = (p) => {
+    const person = personOf(p);
+    if (!person || !SESSION || SESSION.who === "mayu") return;
+    const cur = meRef.current;
+    if (cur && cur.id === person.id && cur.name === person.name && cur.role === person.role) return;
+    setMe(person);
+    const h = savedHome();
+    if (h && h.pass === SESSION.pass) keepHome({ ...h, person });
+  };
   const [opening, setOpening] = useState(() => !!PENDING || !!(savedHome() || {}).on);
   const sound = useChime();
   const whoRef = useRef(null);
@@ -3587,10 +3717,14 @@ function App() {
     SESSION = null;
     dirty.current = false;
     setWho(null);
+    setMe(null);
+    TRACK.sid = "";
+    TRACK.q.length = 0;
+    keepVisit();
     if (w === "mayu") setNotice("That password was changed. Please log in again.");
     else {
       keepHome(null);
-      setNotice("The kitchen code was changed. Ask for the new one.");
+      setNotice("That kitchen code doesn't open the kitchen any more. Ask for a new one.");
     }
   };
   const adopt = (remoteRaw, version, w) => {
@@ -3636,6 +3770,7 @@ function App() {
       return;
     }
     if (flushing.current) return;
+    if (res.person && res.person.id) noteMe(res.person);
     adopt(res.data, res.version, whoRef.current || SESSION.who);
     setSync({ state: dirty.current ? SYNC.state : "ok", error: "" });
   };
@@ -3735,7 +3870,9 @@ function App() {
     dirty.current = false;
     adopt(res.data, res.version, name);
     setSync({ state: dirty.current ? "saving" : "ok", error: "" });
-    if (name === "bran") keepHome({ who: "bran", pass: pw, on: true });
+    const person = personOf(res.person);
+    setMe(person);
+    if (name !== "mayu") keepHome({ who: name, pass: pw, on: true, ...person ? { person } : {} });
     enter(name);
     return "";
   };
@@ -3743,7 +3880,8 @@ function App() {
   const login = async (name, pw, wrong = "That password doesn't open this door.") => {
     if (!store.cloud()) {
       if (!pw || pw !== ((dataRef.current || {}).passwords || {})[name]) return wrong;
-      if (name === "bran") keepHome({ who: "bran", pass: pw, on: true });
+      if (name !== "mayu") keepHome({ who: name, pass: pw, on: true });
+      setMe(null);
       if (name === "mayu" && !DEMO && !store.oldLocal()) store.saveLocal(dataRef.current);
       enter(name);
       return "";
@@ -3805,9 +3943,13 @@ function App() {
       dirty.current = false;
       baseRef.current = dataRef.current;
       verRef.current = -1;
+      setMe(h.person || null);
       setSync({ state: "checking", error: "" });
       enter(h.who);
       pullRef.current();
+      store.enter(h.pass).then((r) => {
+        if (r && r.ok && r.person && SESSION && SESSION.pass === h.pass) noteMe(r.person);
+      });
       return "";
     }
     if (!store.cloud() && !store.oldLocal()) {
@@ -3820,13 +3962,16 @@ function App() {
   };
   const logout = () => {
     if (dirty.current) flushRef.current();
+    trackEnd();
     const w = whoRef.current, h = savedHome();
     SESSION = null;
     setWho(null);
-    if (w === "bran" && h) keepHome({ ...h, on: false });
+    setMe(null);
+    if (w !== "mayu" && h) keepHome(null);
   };
   const forget = () => {
     keepHome(null);
+    setMe(null);
     if (!fileCfg().url) saveCfg(null);
     SESSION = null;
     setNotice("");
@@ -3857,6 +4002,7 @@ function App() {
     SESSION = null;
     dirty.current = false;
     setWho(null);
+    setMe(null);
     setNotice("");
     put(normalise(store.loadLocal()));
   };
@@ -3883,6 +4029,7 @@ function App() {
     dirty.current = false;
     setDemo(on);
     setWho(null);
+    setMe(null);
     setNotice("");
     put(normalise(store.loadLocal()));
   };
@@ -3907,6 +4054,7 @@ function App() {
         PENDING = null;
         err = await loginRef.current(p.who, p.pass, "That link no longer opens this kitchen.");
       } else if (h && h.on) err = await resumeRef.current(h, true);
+      else if (h) keepHome(null);
       setOpening(false);
       if (err) setNotice(err);
     })();
@@ -3931,6 +4079,62 @@ function App() {
       window.removeEventListener("online", look);
     };
   }, []);
+  useEffect(() => {
+    if (who !== "bran" && who !== "guest") return;
+    let last = Date.now();
+    const touch = () => {
+      last = Date.now();
+    };
+    const first = setTimeout(() => {
+      track("open");
+      sendTrack();
+    }, 1200);
+    const beat = setInterval(() => {
+      if (!document.hidden && TRACK.sid && Date.now() - last < 10 * 6e4) track("beat");
+    }, 6e4);
+    const send = setInterval(() => {
+      if (TRACK.q.length) sendTrack();
+    }, 3e4);
+    const bye = () => {
+      if (!tracking() || !TRACK.sid) return;
+      if (!TRACK.closed) {
+        TRACK.closed = true;
+        TRACK.q.push({ e: "close", t: (/* @__PURE__ */ new Date()).toISOString(), s: TRACK.sid });
+      }
+      sendTrack(true);
+    };
+    const vis = () => {
+      if (!tracking()) return;
+      if (document.hidden) {
+        TRACK.hiddenAt = Date.now();
+        bye();
+        return;
+      }
+      TRACK.closed = false;
+      touch();
+      if (!TRACK.sid || Date.now() - TRACK.hiddenAt > 20 * 6e4) {
+        TRACK.sid = "";
+        keepVisit();
+        track("open");
+      } else {
+        TRACK.closed = false;
+        track("back");
+      }
+      sendTrack();
+    };
+    const evs = ["pointerdown", "keydown", "wheel", "touchstart"];
+    evs.forEach((n) => window.addEventListener(n, touch, { passive: true }));
+    document.addEventListener("visibilitychange", vis);
+    window.addEventListener("pagehide", bye);
+    return () => {
+      clearTimeout(first);
+      clearInterval(beat);
+      clearInterval(send);
+      evs.forEach((n) => window.removeEventListener(n, touch));
+      document.removeEventListener("visibilitychange", vis);
+      window.removeEventListener("pagehide", bye);
+    };
+  }, [who]);
   const settingsNow = who && !demo && data ? data.settings : void 0;
   useEffect(() => {
     if (who && !demo && data) {
@@ -3941,7 +4145,7 @@ function App() {
   }, [who, demo, settingsNow]);
   const syncApi = { connect, disconnect, bringOver };
   const gateUp = data && !who && !opening;
-  return /* @__PURE__ */ React.createElement(NameCtx.Provider, { value: names }, /* @__PURE__ */ React.createElement(SyncCtx.Provider, { value: syncApi }, /* @__PURE__ */ React.createElement("style", null, CSS), /* @__PURE__ */ React.createElement(Backdrop, null), /* @__PURE__ */ React.createElement("div", { style: { position: "relative", zIndex: 1, minHeight: "100vh", padding: "18px 14px 44px", fontFamily: F, color: C.ink, fontSize: 17, lineHeight: 1.5 } }, gateUp && showDemo && !leaving && /* @__PURE__ */ React.createElement("button", { onClick: () => toggleDemo(!demo), className: "bb-press", style: { position: "absolute", top: 12, left: 12, zIndex: 6, font: `500 14px ${F}`, letterSpacing: "0.08em", color: demo ? "#fff" : C.soft, background: demo ? C.sageDeep : C.parch, border: `1px solid ${demo ? C.sageDeep : C.line}`, borderRadius: 999, padding: "5px 12px", cursor: "pointer" } }, demo ? "leave demo" : "demo"), gateUp && !demo && !leaving && /* @__PURE__ */ React.createElement(CookDoor, { name: names.mayu, onLogin: (pw) => login("mayu", pw) }), /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 560, margin: "0 auto" } }, (!data || opening) && /* @__PURE__ */ React.createElement("div", { className: "bb-rise", style: { textAlign: "center", paddingTop: 60 } }, /* @__PURE__ */ React.createElement(ChefBunny, { size: 120 }), /* @__PURE__ */ React.createElement(Sub, null, "Warming the kitchen\u2026")), gateUp && /* @__PURE__ */ React.createElement(Gate, { key: demo ? "demo" : "gate", onCode: enterCode, notice, home, onResume: () => resume(home, false), onForget: forget, canForget: !!home || !!savedCfg() && !fileCfg().url, demo, onRole: enter, leaving }), data && !opening && who === "mayu" && /* @__PURE__ */ React.createElement(Screen, { k: "cook" }, /* @__PURE__ */ React.createElement(Cook, { data, update, out: logout, sound })), data && !opening && (who === "bran" || who === "guest") && /* @__PURE__ */ React.createElement(Screen, { k: who }, /* @__PURE__ */ React.createElement(Diner, { data, update, out: logout, mode: who, sound }))))));
+  return /* @__PURE__ */ React.createElement(NameCtx.Provider, { value: names }, /* @__PURE__ */ React.createElement(MeCtx.Provider, { value: me }, /* @__PURE__ */ React.createElement(SyncCtx.Provider, { value: syncApi }, /* @__PURE__ */ React.createElement("style", null, CSS), /* @__PURE__ */ React.createElement(Backdrop, null), /* @__PURE__ */ React.createElement("div", { style: { position: "relative", zIndex: 1, minHeight: "100vh", padding: "18px 14px 44px", fontFamily: F, color: C.ink, fontSize: 17, lineHeight: 1.5 } }, gateUp && showDemo && !leaving && /* @__PURE__ */ React.createElement("button", { onClick: () => toggleDemo(!demo), className: "bb-press", style: { position: "absolute", top: 12, left: 12, zIndex: 6, font: `500 14px ${F}`, letterSpacing: "0.08em", color: demo ? "#fff" : C.soft, background: demo ? C.sageDeep : C.parch, border: `1px solid ${demo ? C.sageDeep : C.line}`, borderRadius: 999, padding: "5px 12px", cursor: "pointer" } }, demo ? "leave demo" : "demo"), gateUp && !demo && !leaving && /* @__PURE__ */ React.createElement(CookDoor, { name: names.mayu, onLogin: (pw) => login("mayu", pw) }), /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 560, margin: "0 auto" } }, (!data || opening) && /* @__PURE__ */ React.createElement("div", { className: "bb-rise", style: { textAlign: "center", paddingTop: 60 } }, /* @__PURE__ */ React.createElement(ChefBunny, { size: 120 }), /* @__PURE__ */ React.createElement(Sub, null, "Warming the kitchen\u2026")), gateUp && /* @__PURE__ */ React.createElement(Gate, { key: demo ? "demo" : "gate", onCode: enterCode, notice, onForget: forget, canForget: !!home || !!savedCfg() && !fileCfg().url, demo, onRole: enter, leaving }), data && !opening && who === "mayu" && /* @__PURE__ */ React.createElement(Screen, { k: "cook" }, /* @__PURE__ */ React.createElement(Cook, { data, update, out: logout, sound })), data && !opening && (who === "bran" || who === "guest") && /* @__PURE__ */ React.createElement(Screen, { k: who }, /* @__PURE__ */ React.createElement(Diner, { data, update, out: logout, mode: who, sound })))))));
 }
 function Screen({ k, children }) {
   return /* @__PURE__ */ React.createElement("div", { key: k, className: "bb-screen" }, children);
@@ -4001,7 +4205,7 @@ function CookDoor({ name, onLogin }) {
     setErr("");
   }, onEnter: go, placeholder: "Password", autoFocus: true }), /* @__PURE__ */ React.createElement(Btn, { small: true, onClick: go, disabled: busy || !pw }, busy ? "Checking\u2026" : "Log in"), err && /* @__PURE__ */ React.createElement("div", { style: { font: `15px/1.4 ${F}`, color: C.tomato, textAlign: "center" } }, err)));
 }
-function Gate({ onCode, notice, home, onResume, onForget, canForget, demo, onRole, leaving }) {
+function Gate({ onCode, notice, onForget, canForget, demo, onRole, leaving }) {
   const names = useNames();
   const [code, setCode] = useState("");
   const [err, setErr] = useState("");
@@ -4017,13 +4221,10 @@ function Gate({ onCode, notice, home, onResume, onForget, canForget, demo, onRol
       setNope((n) => n + 1);
     }
   };
-  const shown = useRef(home);
-  if (!leaving && !busy) shown.current = home;
-  home = shown.current;
-  return /* @__PURE__ */ React.createElement("div", { className: leaving ? "bb-gate leaving" : "bb-gate" }, /* @__PURE__ */ React.createElement("div", { className: "bb-gate-bunny", style: { textAlign: "center", marginBottom: 6 } }, /* @__PURE__ */ React.createElement(ChefBunny, { size: 168 })), /* @__PURE__ */ React.createElement("div", { key: nope, className: nope ? "bb-gate-card bb-nope" : "bb-gate-card" }, /* @__PURE__ */ React.createElement(Panel, { ornate: true }, /* @__PURE__ */ React.createElement(Title, { size: 36 }, names.title), /* @__PURE__ */ React.createElement(Divider, null), demo ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap", margin: "8px 0 4px" } }, [["mayu", names.mayu], ["bran", names.bran], ["guest", "Guest"]].map(([k, l]) => /* @__PURE__ */ React.createElement(Btn, { key: k, tone: "quiet", onClick: () => onRole(k) }, l))) : /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 300, margin: "6px auto 0", display: "grid", gap: 10 } }, home && /* @__PURE__ */ React.createElement(Btn, { onClick: () => run("home", onResume), disabled: !!busy }, busy === "home" ? "Opening\u2026" : `Come in, ${names.bran}`), /* @__PURE__ */ React.createElement(SecretField, { value: code, onChange: (v) => {
+  return /* @__PURE__ */ React.createElement("div", { className: leaving ? "bb-gate leaving" : "bb-gate" }, /* @__PURE__ */ React.createElement("div", { className: "bb-gate-bunny", style: { textAlign: "center", marginBottom: 6 } }, /* @__PURE__ */ React.createElement(ChefBunny, { size: 168 })), /* @__PURE__ */ React.createElement("div", { key: nope, className: nope ? "bb-gate-card bb-nope" : "bb-gate-card" }, /* @__PURE__ */ React.createElement(Panel, { ornate: true }, /* @__PURE__ */ React.createElement(Title, { size: 36 }, names.title), /* @__PURE__ */ React.createElement(Divider, null), demo ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap", margin: "8px 0 4px" } }, [["mayu", names.mayu], ["bran", names.bran], ["guest", "Guest"]].map(([k, l]) => /* @__PURE__ */ React.createElement(Btn, { key: k, tone: "quiet", onClick: () => onRole(k) }, l))) : /* @__PURE__ */ React.createElement("div", { style: { maxWidth: 300, margin: "6px auto 0", display: "grid", gap: 10 } }, /* @__PURE__ */ React.createElement(SecretField, { value: code, onChange: (v) => {
     setCode(v);
     setErr("");
-  }, onEnter: () => run("code", () => onCode(code)), placeholder: "Kitchen code" }), /* @__PURE__ */ React.createElement(Btn, { tone: home ? "quiet" : "solid", onClick: () => run("code", () => onCode(code)), disabled: !!busy || !code.trim() }, busy === "code" ? "Opening\u2026" : "Come in")), (err || notice) && /* @__PURE__ */ React.createElement("div", { className: "bb-rise", style: { font: `16px/1.45 ${F}`, color: err ? C.tomato : C.sageDeep, textAlign: "center", marginTop: 12 } }, err || notice))), canForget && !demo && /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", marginTop: 14 } }, /* @__PURE__ */ React.createElement("button", { onClick: onForget, style: { font: `italic 15px ${F}`, color: C.soft, background: "none", border: "none", cursor: "pointer", textDecoration: "underline dotted" } }, "Forget this browser")));
+  }, onEnter: () => run("code", () => onCode(code)), placeholder: "Kitchen code" }), /* @__PURE__ */ React.createElement(Btn, { onClick: () => run("code", () => onCode(code)), disabled: !!busy || !code.trim() }, busy === "code" ? "Opening\u2026" : "Come in")), (err || notice) && /* @__PURE__ */ React.createElement("div", { className: "bb-rise", style: { font: `16px/1.45 ${F}`, color: err ? C.tomato : C.sageDeep, textAlign: "center", marginTop: 12 } }, err || notice))), canForget && !demo && /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", marginTop: 14 } }, /* @__PURE__ */ React.createElement("button", { onClick: onForget, style: { font: `italic 15px ${F}`, color: C.soft, background: "none", border: "none", cursor: "pointer", textDecoration: "underline dotted" } }, "Forget this browser")));
 }
 function SyncDot() {
   const s = useSync();
@@ -4052,12 +4253,12 @@ function Cook({ data, update, out, sound }) {
     freshCr.forEach((c) => seenCravings.current.add(c.id));
     const first = fresh[0];
     const label = first ? first.recipeId ? data.recipes.find((x) => x.id === first.recipeId)?.name : data.drinks.find((x) => x.id === first.drinkId)?.name : `Craving: ${freshCr[0].text}`;
-    setNote({ who: first ? first.from === "guest" ? `Guest${first.guestName ? " \xB7 " + first.guestName : ""}` : names.bran : names.bran, body: fresh.length > 1 ? `${label} and ${fresh.length - 1} more` : label, when: first?.whenLabel || "" });
+    setNote({ who: first ? fromLabel(first, names) : freshCr[0].by || names.bran, body: fresh.length > 1 ? `${label} and ${fresh.length - 1} more` : label, when: first?.whenLabel || "" });
     sound.ping();
     const t = setTimeout(() => setNote(null), 5400);
     return () => clearTimeout(t);
   }, [data.requests, data.cravings]);
-  const titles = { freezer: "Freezer", fridge: "Fridge, Pantry & Snacks", orders: "Orders", recipes: "Recipe Book", cellar: "Cellar & Bar", week: "This Week", grocery: "Grocery List", guest: "Kitchen & Guests", season: "In Season", pets: "Pets", sketch: "Fridge Drawing" };
+  const titles = { freezer: "Freezer", fridge: "Fridge, Pantry & Snacks", orders: "Orders", recipes: "Recipe Book", cellar: "Cellar & Bar", week: "This Week", grocery: "Grocery List", guest: "Kitchen & Guests", people: "People", season: "In Season", pets: "Pets", sketch: "Fridge Drawing" };
   return /* @__PURE__ */ React.createElement("div", null, note && /* @__PURE__ */ React.createElement("div", { className: "bb-drop", style: { position: "fixed", top: 12, left: 12, right: 12, zIndex: 90, maxWidth: 532, margin: "0 auto", background: "#FFFCF6", border: `1px solid ${C.gold}`, borderRadius: 16, padding: "12px 14px", display: "flex", gap: 11, alignItems: "center", boxShadow: "0 12px 30px rgba(70,48,42,0.26)" } }, /* @__PURE__ */ React.createElement("div", { style: { width: 40, height: 40, borderRadius: 10, background: C.blush, display: "grid", placeItems: "center", overflow: "hidden", flexShrink: 0 } }, /* @__PURE__ */ React.createElement(ChefBunny, { size: 44, still: true })), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `500 17px ${F}`, color: C.ink } }, "New from ", note.who), /* @__PURE__ */ React.createElement("div", { style: { font: `15px ${F}`, color: C.soft, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, note.body, note.when ? ` \u2014 ${note.when}` : "")), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => {
     setNote(null);
     setSection("orders");
@@ -4066,7 +4267,17 @@ function Cook({ data, update, out, sound }) {
     const i = l.findIndex((n) => n === "*" || name && n.toLowerCase() === name.toLowerCase());
     if (i >= 0) l.splice(i, 1);
     return l;
-  })() } : { ...p, [k === "dog" ? "dogTreat" : "catTreat"]: false }) }, /* @__PURE__ */ React.createElement(Fridge, { active: section, onPick: setSection, counts: { orders: openCount }, sketchUrl: data.sketchBran && data.sketchBran.url })), /* @__PURE__ */ React.createElement(Sub, null, "Tap a door or a magnet")), section && /* @__PURE__ */ React.createElement(Window, { title: titles[section], onClose: () => setSection(null), wide: section === "recipes" || section === "guest" }, section === "freezer" && /* @__PURE__ */ React.createElement(Stores, { data, update, locs: ["freezer"] }), section === "fridge" && /* @__PURE__ */ React.createElement(Stores, { data, update, locs: ["fridge", "pantry", "snacks"] }), section === "orders" && /* @__PURE__ */ React.createElement(Post, { data, update }), section === "recipes" && /* @__PURE__ */ React.createElement(Book, { data, update, cook: setCooking }), section === "cellar" && /* @__PURE__ */ React.createElement(Cellar, { data, update }), section === "week" && /* @__PURE__ */ React.createElement(Week, { data, update }), section === "grocery" && /* @__PURE__ */ React.createElement(GroceryList, { data, update, who: "mayu" }), section === "guest" && /* @__PURE__ */ React.createElement(GuestSettings, { data, update }), section === "season" && /* @__PURE__ */ React.createElement(InSeason, null), section === "pets" && /* @__PURE__ */ React.createElement(PetSettings, { data, update }), section === "sketch" && /* @__PURE__ */ React.createElement(SketchPad, { data, update, who: "mayu" })), plantsOpen && /* @__PURE__ */ React.createElement(PlantRoom, { data, update, onClose: () => setPlantsOpen(false) }), cooking && /* @__PURE__ */ React.createElement(CookMode, { recipe: cooking, close: () => setCooking(null) }));
+  })() } : { ...p, [k === "dog" ? "dogTreat" : "catTreat"]: false }) }, /* @__PURE__ */ React.createElement(Fridge, { active: section, onPick: setSection, counts: { orders: openCount }, sketchUrl: data.sketchBran && data.sketchBran.url })), /* @__PURE__ */ React.createElement(Sub, null, "Tap a door or a magnet"), !DEMO && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", marginTop: 4 } }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => setSection("people"),
+      className: "bb-press",
+      title: "Everyone with a kitchen code",
+      style: { display: "flex", alignItems: "center", gap: 7, font: `500 15px ${F}`, color: C.ink, background: C.parch, border: `1px solid ${C.line}`, borderRadius: 999, padding: "7px 14px", cursor: "pointer" }
+    },
+    /* @__PURE__ */ React.createElement("svg", { width: "20", height: "14", viewBox: "0 0 20 14", "aria-hidden": "true" }, /* @__PURE__ */ React.createElement("circle", { cx: "6.5", cy: "4", r: "3", fill: C.rose, stroke: OUT, strokeWidth: "1.1" }), /* @__PURE__ */ React.createElement("path", { d: "M1 13 c0 -3.4 2.4 -5 5.5 -5 s5.5 1.6 5.5 5", fill: C.rose, stroke: OUT, strokeWidth: "1.1" }), /* @__PURE__ */ React.createElement("circle", { cx: "13.8", cy: "4.6", r: "2.6", fill: C.sageLt, stroke: OUT, strokeWidth: "1.1" }), /* @__PURE__ */ React.createElement("path", { d: "M9.6 13 c0.3 -2.9 2 -4.3 4.2 -4.3 s4.3 1.4 4.6 4.3", fill: C.sageLt, stroke: OUT, strokeWidth: "1.1" })),
+    "People"
+  ))), section && /* @__PURE__ */ React.createElement(Window, { title: titles[section], onClose: () => setSection(null), wide: section === "recipes" || section === "guest" || section === "people" }, section === "freezer" && /* @__PURE__ */ React.createElement(Stores, { data, update, locs: ["freezer"] }), section === "fridge" && /* @__PURE__ */ React.createElement(Stores, { data, update, locs: ["fridge", "pantry", "snacks"] }), section === "orders" && /* @__PURE__ */ React.createElement(Post, { data, update }), section === "recipes" && /* @__PURE__ */ React.createElement(Book, { data, update, cook: setCooking }), section === "cellar" && /* @__PURE__ */ React.createElement(Cellar, { data, update }), section === "week" && /* @__PURE__ */ React.createElement(Week, { data, update }), section === "grocery" && /* @__PURE__ */ React.createElement(GroceryList, { data, update, who: "mayu" }), section === "guest" && /* @__PURE__ */ React.createElement(GuestSettings, { data, update }), section === "people" && /* @__PURE__ */ React.createElement(PeopleRoom, { data, update }), section === "season" && /* @__PURE__ */ React.createElement(InSeason, null), section === "pets" && /* @__PURE__ */ React.createElement(PetSettings, { data, update }), section === "sketch" && /* @__PURE__ */ React.createElement(SketchPad, { data, update, who: "mayu" })), plantsOpen && /* @__PURE__ */ React.createElement(PlantRoom, { data, update, onClose: () => setPlantsOpen(false) }), cooking && /* @__PURE__ */ React.createElement(CookMode, { recipe: cooking, close: () => setCooking(null) }));
 }
 function Stores({ data, update, locs }) {
   const [adding, setAdding] = useState(null);
@@ -4103,7 +4314,7 @@ function Post({ data, update }) {
   const rec = (id) => data.recipes.find((r) => r.id === id);
   const dr = (id) => data.drinks.find((d) => d.id === id);
   const names = useNames();
-  const from = (r) => r.from === "guest" ? `Guest${r.guestName ? " \xB7 " + r.guestName : ""}` : names.bran;
+  const from = (r) => fromLabel(r, names);
   const line = (r) => (r.recipeId ? rec(r.recipeId)?.name : dr(r.drinkId)?.name) + ((r.qty || 1) > 1 ? ` \xD7${r.qty}` : "");
   const shopping = useMemo(() => {
     const s = /* @__PURE__ */ new Set();
@@ -4118,9 +4329,9 @@ function Post({ data, update }) {
 Shopping: ${shopping.join(", ")}` : "") + (cravings.length ? `
 
 Cravings:
-${cravings.map((c) => "\xB7 " + c.text).join("\n")}` : "");
+${cravings.map((c) => "\xB7 " + c.text + (c.by ? ` (${c.by})` : "")).join("\n")}` : "");
   if (!open.length && !cravings.length) return /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center" } }, /* @__PURE__ */ React.createElement(Mailbox, { size: 170, count: 0 }), /* @__PURE__ */ React.createElement(Sub, null, "No orders yet"));
-  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", marginBottom: 12 } }, /* @__PURE__ */ React.createElement(Mailbox, { size: 170, count: open.length + cravings.length })), shopping.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { background: C.blush, borderRadius: 8, padding: "12px 14px", marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Caps, { style: { color: C.roseDeep, marginBottom: 2 } }, "To buy"), /* @__PURE__ */ React.createElement("div", { style: { font: `17px/1.5 ${F}` } }, shopping.join(", "))), /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 10, marginBottom: 14 } }, open.map((r) => /* @__PURE__ */ React.createElement("div", { key: r.id, style: { background: r.from === "guest" ? C.blush : C.parchWell, borderRadius: 10, padding: 13, display: "flex", gap: 10, alignItems: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `500 18px ${F}` } }, line(r)), r.custom && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.roseDeep } }, r.custom), /* @__PURE__ */ React.createElement("div", { style: { font: `15px ${F}`, color: C.soft } }, from(r), " \xB7 ", r.whenLabel, r.note ? ` \xB7 ${r.note}` : "")), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => update((p) => ({ ...p, requests: p.requests.map((x) => x.id === r.id ? { ...x, done: true, updatedAt: Date.now() } : x) })) }, "Done")))), cravings.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Cravings"), /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 10, marginBottom: 14 } }, cravings.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, style: { background: C.parchWell, border: `1px dashed ${C.roseDeep}`, borderRadius: 10, padding: 13, display: "flex", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, font: `italic 17px/1.5 ${F}` } }, c.text), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => update((p) => ({ ...p, cravings: p.cravings.map((x) => x.id === c.id ? { ...x, done: true, updatedAt: Date.now() } : x) })) }, "Clear"))))), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "quiet", onClick: () => {
+  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", marginBottom: 12 } }, /* @__PURE__ */ React.createElement(Mailbox, { size: 170, count: open.length + cravings.length })), shopping.length > 0 && /* @__PURE__ */ React.createElement("div", { style: { background: C.blush, borderRadius: 8, padding: "12px 14px", marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Caps, { style: { color: C.roseDeep, marginBottom: 2 } }, "To buy"), /* @__PURE__ */ React.createElement("div", { style: { font: `17px/1.5 ${F}` } }, shopping.join(", "))), /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 10, marginBottom: 14 } }, open.map((r) => /* @__PURE__ */ React.createElement("div", { key: r.id, style: { background: r.from === "guest" ? C.blush : C.parchWell, borderRadius: 10, padding: 13, display: "flex", gap: 10, alignItems: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `500 18px ${F}` } }, line(r)), r.custom && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.roseDeep } }, r.custom), /* @__PURE__ */ React.createElement("div", { style: { font: `15px ${F}`, color: C.soft } }, from(r), " \xB7 ", r.whenLabel, r.note ? ` \xB7 ${r.note}` : "")), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => update((p) => ({ ...p, requests: p.requests.map((x) => x.id === r.id ? { ...x, done: true, updatedAt: Date.now() } : x) })) }, "Done")))), cravings.length > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Cravings"), /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 10, marginBottom: 14 } }, cravings.map((c) => /* @__PURE__ */ React.createElement("div", { key: c.id, style: { background: C.parchWell, border: `1px dashed ${C.roseDeep}`, borderRadius: 10, padding: 13, display: "flex", gap: 10 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, font: `italic 17px/1.5 ${F}` } }, c.text, c.by && /* @__PURE__ */ React.createElement("span", { style: { fontStyle: "normal", font: `15px ${F}`, color: C.soft } }, " \xB7 ", c.by)), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => update((p) => ({ ...p, cravings: p.cravings.map((x) => x.id === c.id ? { ...x, done: true, updatedAt: Date.now() } : x) })) }, "Clear"))))), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "quiet", onClick: () => {
     navigator.clipboard?.writeText(summary());
     setCopied(true);
     setTimeout(() => setCopied(false), 1600);
@@ -4481,13 +4692,357 @@ function Profiles({ data, update }) {
   const set = (patch) => update((p) => ({ ...p, settings: { ...p.settings || {}, ...patch } }));
   const name = (k, v) => set({ names: { ...(data.settings || {}).names || {}, [k]: v } });
   const line = (label, value, onChange, placeholder) => /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 76, flexShrink: 0, font: `16px ${F}`, color: C.soft } }, label), /* @__PURE__ */ React.createElement(Field, { value, onChange: (e) => onChange(e.target.value.slice(0, 24)), placeholder, "aria-label": label }));
-  return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Profiles"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, marginBottom: 12 } }, line("Cook", nm.mayu || "", (v) => name("mayu", v), "Mayu"), line("Home", nm.bran || "", (v) => name("bran", v), "Bran"), line("Site name", st.title || "", (v) => set({ title: v }), "Bistro 309")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 22 } }, /* @__PURE__ */ React.createElement("span", { style: { font: `16px ${F}`, color: C.soft, marginRight: 4 } }, "Demo button"), /* @__PURE__ */ React.createElement(Chip, { active: st.demo !== false, onClick: () => set({ demo: true }) }, "Shown"), /* @__PURE__ */ React.createElement(Chip, { active: st.demo === false, onClick: () => set({ demo: false }) }, "Hidden")));
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Profiles"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 8, marginBottom: 12 } }, line("Cook", nm.mayu || "", (v) => name("mayu", v), "Mayu"), !store.cloud() && line("Home", nm.bran || "", (v) => name("bran", v), "Bran"), line("Site name", st.title || "", (v) => set({ title: v }), "Bistro 309")), store.cloud() && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px/1.45 ${F}`, color: C.soft, margin: "-4px 0 12px" } }, "Home's and guests' names are on the People page."), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", marginBottom: 22 } }, /* @__PURE__ */ React.createElement("span", { style: { font: `16px ${F}`, color: C.soft, marginRight: 4 } }, "Demo button"), /* @__PURE__ */ React.createElement(Chip, { active: st.demo !== false, onClick: () => set({ demo: true }) }, "Shown"), /* @__PURE__ */ React.createElement(Chip, { active: st.demo === false, onClick: () => set({ demo: false }) }, "Hidden")));
 }
 function GuestSettings({ data, update }) {
   const ev = data.event || EVENTS.none;
   const setEv = (patch) => update((p) => ({ ...p, event: { ...p.event || {}, ...patch } }));
   const preview = resolveEvent(ev);
-  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement(Connection, null), !DEMO && /* @__PURE__ */ React.createElement(Codes, { data, update }), !DEMO && /* @__PURE__ */ React.createElement(Profiles, { data, update }), /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Guest menu"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 } }, /* @__PURE__ */ React.createElement(Chip, { active: data.guestOrdering !== false, onClick: () => update((p) => ({ ...p, guestOrdering: true })) }, "Guests can order"), /* @__PURE__ */ React.createElement(Chip, { active: data.guestOrdering === false, onClick: () => update((p) => ({ ...p, guestOrdering: false })) }, "Display only")), /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px/1.5 ${F}`, color: C.soft, marginBottom: 22 } }, "Display only hides the ordering buttons and the bell \u2014 useful when you're hosting and cooking a set menu."), /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Event"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 7, flexWrap: "wrap" } }, Object.entries(EVENTS).map(([k, v]) => /* @__PURE__ */ React.createElement(Chip, { key: k, active: ev.preset === k, onClick: () => setEv({ preset: k, name: "" }) }, v.label))), ev.preset !== "none" && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, display: "grid", gap: 10 } }, /* @__PURE__ */ React.createElement(Field, { placeholder: `Banner name (default: ${(EVENTS[ev.preset] || EVENTS.custom).name || "none"})`, value: ev.name || "", onChange: (e) => setEv({ name: e.target.value }) }), ev.preset === "custom" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, alignItems: "center", font: `15px ${F}`, color: C.soft } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6 } }, "Banner ", /* @__PURE__ */ React.createElement("input", { type: "color", value: ev.bg || EVENTS.custom.bg, onChange: (e) => setEv({ bg: e.target.value }), style: { width: 34, height: 28, border: `1px solid ${C.line}`, borderRadius: 6, background: "none", padding: 0 } })), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6 } }, "Accent ", /* @__PURE__ */ React.createElement("input", { type: "color", value: ev.accent || EVENTS.custom.accent, onChange: (e) => setEv({ accent: e.target.value }), style: { width: 34, height: 28, border: `1px solid ${C.line}`, borderRadius: 6, background: "none", padding: 0 } }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 7, flexWrap: "wrap" } }, DECORS.map(([k, l]) => /* @__PURE__ */ React.createElement(Chip, { key: k, active: (ev.decor || "hearts") === k, onClick: () => setEv({ decor: k }) }, l))))), preview && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 18 } }, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Preview"), /* @__PURE__ */ React.createElement("div", { style: { border: `1px solid ${C.line}`, borderRadius: 4, padding: 6, background: C.parch } }, /* @__PURE__ */ React.createElement(EventBanner, { ev: preview }), /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.soft, textAlign: "center", paddingBottom: 6 } }, "The menu title and dishes follow underneath"))));
+  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement(Connection, null), !DEMO && /* @__PURE__ */ React.createElement(Profiles, { data, update }), /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Guest menu"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 6 } }, /* @__PURE__ */ React.createElement(Chip, { active: data.guestOrdering !== false, onClick: () => update((p) => ({ ...p, guestOrdering: true })) }, "Guests can order"), /* @__PURE__ */ React.createElement(Chip, { active: data.guestOrdering === false, onClick: () => update((p) => ({ ...p, guestOrdering: false })) }, "Display only")), /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px/1.5 ${F}`, color: C.soft, marginBottom: 22 } }, "Display only hides the ordering buttons and the bell \u2014 useful when you're hosting and cooking a set menu."), /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Event"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 7, flexWrap: "wrap" } }, Object.entries(EVENTS).map(([k, v]) => /* @__PURE__ */ React.createElement(Chip, { key: k, active: ev.preset === k, onClick: () => setEv({ preset: k, name: "" }) }, v.label))), ev.preset !== "none" && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 12, display: "grid", gap: 10 } }, /* @__PURE__ */ React.createElement(Field, { placeholder: `Banner name (default: ${(EVENTS[ev.preset] || EVENTS.custom).name || "none"})`, value: ev.name || "", onChange: (e) => setEv({ name: e.target.value }) }), ev.preset === "custom" && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, alignItems: "center", font: `15px ${F}`, color: C.soft } }, /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6 } }, "Banner ", /* @__PURE__ */ React.createElement("input", { type: "color", value: ev.bg || EVENTS.custom.bg, onChange: (e) => setEv({ bg: e.target.value }), style: { width: 34, height: 28, border: `1px solid ${C.line}`, borderRadius: 6, background: "none", padding: 0 } })), /* @__PURE__ */ React.createElement("label", { style: { display: "flex", alignItems: "center", gap: 6 } }, "Accent ", /* @__PURE__ */ React.createElement("input", { type: "color", value: ev.accent || EVENTS.custom.accent, onChange: (e) => setEv({ accent: e.target.value }), style: { width: 34, height: 28, border: `1px solid ${C.line}`, borderRadius: 6, background: "none", padding: 0 } }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 7, flexWrap: "wrap" } }, DECORS.map(([k, l]) => /* @__PURE__ */ React.createElement(Chip, { key: k, active: (ev.decor || "hearts") === k, onClick: () => setEv({ decor: k }) }, l))))), preview && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 18 } }, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Preview"), /* @__PURE__ */ React.createElement("div", { style: { border: `1px solid ${C.line}`, borderRadius: 4, padding: 6, background: C.parch } }, /* @__PURE__ */ React.createElement(EventBanner, { ev: preview }), /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.soft, textAlign: "center", paddingBottom: 6 } }, "The menu title and dishes follow underneath"))));
+}
+const copyText = (t) => {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t);
+      return;
+    }
+  } catch {
+  }
+  try {
+    const el = document.createElement("textarea");
+    el.value = t;
+    el.style.position = "fixed";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand("copy");
+    el.remove();
+  } catch {
+  }
+};
+const whoOfRole = (role) => role === "home" ? "bran" : "guest";
+const ago = (t) => {
+  if (!t) return "";
+  const d = new Date(t), now = /* @__PURE__ */ new Date(), s = (now - d) / 1e3;
+  if (s < 90) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).toLowerCase();
+  const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((day(now) - day(d)) / 864e5);
+  if (diff === 0) return `today, ${time}`;
+  if (diff === 1) return `yesterday, ${time}`;
+  if (diff < 7) return `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
+  return d.toLocaleDateString([], { month: "short", day: "numeric", ...d.getFullYear() !== now.getFullYear() ? { year: "numeric" } : {} });
+};
+const hours = (m) => {
+  m = Math.round(m || 0);
+  if (m < 1) return "under a minute";
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h} h ${r} min` : `${h} h`;
+};
+const untilLabel = (d) => {
+  if (!d) return "";
+  const x = /* @__PURE__ */ new Date(d + "T12:00:00");
+  return x.toLocaleDateString([], { month: "short", day: "numeric", ...x.getFullYear() !== (/* @__PURE__ */ new Date()).getFullYear() ? { year: "numeric" } : {} });
+};
+const expired = (d) => !!d && /* @__PURE__ */ new Date(d + "T23:59:59") < /* @__PURE__ */ new Date();
+const hereNow = (p) => !!p.last_seen && Date.now() - new Date(p.last_seen).getTime() < 15e4 && p.last_event !== "close";
+const SCREENS = { food: "Looked at the menu", drinks: "Looked at the drinks", fridge: "Looked in the fridge", pantry: "Opened the pantry basket", freezer: "Looked in the freezer", grocery: "Opened the grocery list", sketch: "Looked at the fridge drawing", season: "Checked what's in season", arcade: "Went to the arcade", game: "Played Cat Survivors", wheel: "Went to the Wheel of Meals" };
+const describe = (ev) => {
+  const d = ev.detail || {};
+  if (ev.event === "open") return `Came in${ev.device ? ` on ${ev.device}` : ""}`;
+  if (ev.event === "close") return "Left";
+  if (ev.event === "back") return "Came back";
+  if (ev.event === "order") return `Ordered ${(d.items || []).join(", ") || "something"}`;
+  if (ev.event === "craving") return `Asked for "${d.text || "something"}"`;
+  if (ev.event === "grocery") return `Added ${d.text || "something"} to the grocery list`;
+  if (ev.event === "wheel") return `The wheel landed on ${d.dish || "a dish"}`;
+  if (ev.event === "arcade") return d.won ? `Finished Cat Survivors \xB7 ${Number(d.score || 0).toLocaleString()}` : `Cat Survivors, reached stage ${d.stage || 1} \xB7 ${Number(d.score || 0).toLocaleString()}`;
+  if (ev.event === "view") return SCREENS[d.screen] || "Looked around";
+  return ev.event;
+};
+async function sendCodeTo(person, title) {
+  const link = codeLink(whoOfRole(person.role), person.code);
+  const first = (person.name || "").trim().split(/\s+/)[0];
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, text: `${first ? first + ", here" : "Here"} is your way into ${title}.`, url: link });
+      return "Sent.";
+    } catch (e) {
+      if (e && e.name === "AbortError") return "";
+    }
+  }
+  copyText(link);
+  return "Link copied. Paste it into a message.";
+}
+function RoleTag({ role }) {
+  const home = role === "home";
+  return /* @__PURE__ */ React.createElement("span", { style: { font: `500 11.5px ${F}`, letterSpacing: "0.14em", textTransform: "uppercase", color: home ? C.sageDeep : C.roseDeep, background: home ? "rgba(147,165,124,0.16)" : "rgba(227,154,160,0.18)", borderRadius: 999, padding: "2px 8px", whiteSpace: "nowrap" } }, home ? "Home" : "Guest");
+}
+function Initial({ name, role, size = 40 }) {
+  const home = role === "home", ch = ((name || "?").trim()[0] || "?").toUpperCase();
+  return /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", style: { width: size, height: size, flexShrink: 0, borderRadius: size / 2, display: "grid", placeItems: "center", font: `500 ${Math.round(size * 0.48)}px ${F}`, color: "#fff", background: home ? `linear-gradient(160deg, ${C.sage}, ${C.sageDeep})` : `linear-gradient(160deg, ${C.rose}, ${C.roseDeep})`, boxShadow: "inset 0 1px 0 rgba(255,255,255,0.35)" } }, ch);
+}
+function PeopleList({ list, onOpen, onNew, err }) {
+  const names = useNames();
+  const [note, setNote] = useState({});
+  const send = async (p, e) => {
+    e.stopPropagation();
+    const m = await sendCodeTo(p, names.title);
+    if (m) {
+      setNote({ [p.id]: m });
+      setTimeout(() => setNote({}), 2600);
+    }
+  };
+  const copy = (p, e) => {
+    e.stopPropagation();
+    copyText(codeText(whoOfRole(p.role), p.code));
+    setNote({ [p.id]: "Code copied." });
+    setTimeout(() => setNote({}), 1800);
+  };
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `italic 16px/1.4 ${F}`, color: C.soft, minWidth: 0 } }, list && list.length > 0 ? (() => {
+    const here = list.filter(hereNow).length, week = list.reduce((n, p) => n + Number(p.visits_week || 0), 0);
+    return /* @__PURE__ */ React.createElement(React.Fragment, null, here ? /* @__PURE__ */ React.createElement("span", { style: { color: C.sageDeep } }, here, " here now \xB7 ") : null, week, " ", week === 1 ? "visit" : "visits", " this week");
+  })() : "Everyone with a kitchen code"), /* @__PURE__ */ React.createElement(Btn, { small: true, onClick: onNew, style: { whiteSpace: "nowrap" } }, "New person")), err && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.tomato, marginBottom: 10 } }, err), !list ? /* @__PURE__ */ React.createElement(Sub, null, "Fetching\u2026") : /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 10, marginBottom: 24 } }, list.map((p) => {
+    const off = p.status === "paused" || expired(p.access_end);
+    return /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        key: p.id,
+        role: "button",
+        tabIndex: 0,
+        onClick: () => onOpen(p.id),
+        onKeyDown: (e) => e.key === "Enter" && onOpen(p.id),
+        className: "bb-person",
+        style: { background: C.parchWell, border: `1px solid ${C.line}`, borderRadius: 12, padding: "12px 12px 10px", cursor: "pointer", opacity: off ? 0.72 : 1 }
+      },
+      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 12, alignItems: "center" } }, /* @__PURE__ */ React.createElement(Initial, { name: p.name, role: p.role }), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("span", { style: { font: `400 20px/1.2 ${F}`, color: C.ink } }, p.name || "Unnamed"), /* @__PURE__ */ React.createElement(RoleTag, { role: p.role }), p.status === "paused" && /* @__PURE__ */ React.createElement("span", { style: { font: `italic 14px ${F}`, color: C.tomato } }, "paused"), p.status !== "paused" && expired(p.access_end) && /* @__PURE__ */ React.createElement("span", { style: { font: `italic 14px ${F}`, color: C.tomato } }, "ended ", untilLabel(p.access_end)), p.status !== "paused" && p.access_end && !expired(p.access_end) && /* @__PURE__ */ React.createElement("span", { style: { font: `italic 14px ${F}`, color: C.soft } }, "until ", untilLabel(p.access_end))), /* @__PURE__ */ React.createElement("div", { style: { font: `15px/1.4 ${F}`, color: C.soft, marginTop: 2 } }, hereNow(p) ? /* @__PURE__ */ React.createElement("span", { style: { color: C.sageDeep } }, /* @__PURE__ */ React.createElement("span", { className: "bb-here", "aria-hidden": "true" }), "Here now") : p.last_seen ? `Here ${ago(p.last_seen)}` : "Hasn't come in yet", Number(p.visits) > 0 && ` \xB7 ${p.visits} ${Number(p.visits) === 1 ? "visit" : "visits"}`, Number(p.orders) > 0 && ` \xB7 ${p.orders} ${Number(p.orders) === 1 ? "order" : "orders"}`)), /* @__PURE__ */ React.createElement("span", { "aria-hidden": "true", style: { font: `22px ${F}`, color: C.soft, paddingRight: 2 } }, "\u203A")),
+      /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 10, paddingLeft: 52, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "quiet", onClick: (e) => send(p, e), disabled: off, style: { padding: "6px 12px" } }, "Send link"), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: (e) => copy(p, e), disabled: off, style: { padding: "6px 12px" } }, "Copy code"), note[p.id] && /* @__PURE__ */ React.createElement("span", { className: "bb-rise", style: { font: `italic 14px ${F}`, color: C.sageDeep } }, note[p.id]))
+    );
+  }), list.length === 0 && /* @__PURE__ */ React.createElement(Sub, null, "Nobody has a code yet.")));
+}
+function VisitDays({ days }) {
+  const [hover, setHover] = useState(null);
+  const max = Math.max(5, ...days.map((d) => Number(d.minutes) || 0));
+  const lab = (d) => (/* @__PURE__ */ new Date(d.day + "T12:00:00")).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  const shown = hover != null ? days[hover] : null;
+  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 } }, /* @__PURE__ */ React.createElement("span", { style: { font: `16px ${F}`, color: C.ink } }, "Time here, last two weeks"), /* @__PURE__ */ React.createElement("span", { style: { font: `italic 14px ${F}`, color: C.soft, minHeight: 20 } }, shown ? `${lab(shown)}: ${Number(shown.visits) ? `${shown.visits} ${Number(shown.visits) === 1 ? "visit" : "visits"}, ${hours(shown.minutes)}` : "no visits"}` : "")), /* @__PURE__ */ React.createElement(
+    "div",
+    {
+      role: "img",
+      "aria-label": `Time spent each day for the last 14 days: ${days.map((d) => `${lab(d)} ${hours(d.minutes)}`).join("; ")}`,
+      style: { position: "relative", height: 78, display: "flex", alignItems: "flex-end", gap: 2, borderBottom: `1px solid ${C.line}` },
+      onMouseLeave: () => setHover(null)
+    },
+    days.map((d, i) => {
+      const m = Number(d.minutes) || 0, v = Number(d.visits) || 0, h = v ? Math.max(4, Math.round(m / max * 70)) : 0;
+      return /* @__PURE__ */ React.createElement("div", { key: d.day, onMouseEnter: () => setHover(i), onClick: () => setHover(hover === i ? null : i), style: { flex: 1, height: "100%", display: "flex", alignItems: "flex-end", cursor: "default" } }, /* @__PURE__ */ React.createElement("div", { className: "bb-bar-grow", style: { width: "100%", height: h, background: hover === i ? "#9A6E23" : "#B9862F", borderRadius: "4px 4px 0 0", transformOrigin: "50% 100%", animationDelay: `${i * 22}ms`, transition: "background .15s ease" } }));
+    })
+  ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "space-between", font: `13px ${F}`, color: C.soft, marginTop: 4 } }, /* @__PURE__ */ React.createElement("span", null, days.length ? lab(days[0]) : ""), /* @__PURE__ */ React.createElement("span", null, "today")));
+}
+function Tile({ label, value, sub }) {
+  return /* @__PURE__ */ React.createElement("div", { style: { background: C.parchWell, borderRadius: 10, padding: "10px 12px", minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `500 12px ${F}`, letterSpacing: "0.14em", textTransform: "uppercase", color: C.soft } }, label), /* @__PURE__ */ React.createElement("div", { style: { font: `400 22px/1.25 ${F}`, color: C.ink, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, value), sub && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 14px ${F}`, color: C.soft } }, sub));
+}
+function PersonPage({ person, onBack, onSaved, onRemoved }) {
+  const names = useNames();
+  const fresh = !person;
+  const blank = { name: "", role: "guest", code: freshCode(), status: "active", access_end: "", notes: "" };
+  const pick = (p2) => ({ name: p2.name || "", role: p2.role || "guest", code: p2.code || "", status: p2.status || "active", access_end: p2.access_end || "", notes: p2.notes || "" });
+  const [f, setF] = useState(() => person ? pick(person) : blank);
+  const [saved, setSaved] = useState(person || null);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [sure, setSure] = useState(false);
+  const [use, setUse] = useState(null);
+  const [sendMsg, setSendMsg] = useState("");
+  const top = useRef(null);
+  useEffect(() => {
+    const el = top.current && top.current.closest(".bb-win-body");
+    if (el) el.scrollTop = 0;
+  }, [saved && saved.id]);
+  const loadUse = async (id) => {
+    const r = await people.usage(id);
+    if (r.ok) setUse(r);
+  };
+  useEffect(() => {
+    if (!saved || !saved.id) return;
+    loadUse(saved.id);
+    const iv = setInterval(() => {
+      if (!document.hidden) loadUse(saved.id);
+    }, 3e4);
+    return () => clearInterval(iv);
+  }, [saved && saved.id]);
+  const set = (k, v) => {
+    setF((x) => ({ ...x, [k]: v }));
+    setMsg("");
+  };
+  const dirty = !saved || ["name", "role", "code", "status", "access_end", "notes"].some((k) => (f[k] || "") !== (saved[k] || ""));
+  const save = async () => {
+    if (!f.name.trim()) {
+      setMsg("Give them a name first.");
+      return;
+    }
+    if (f.code.trim().length < 3) {
+      setMsg("A code needs at least three letters or numbers.");
+      return;
+    }
+    setBusy(true);
+    CODES_AT = Date.now();
+    const r = await people.save({ ...f, name: f.name.trim(), code: f.code.trim(), id: saved ? saved.id : void 0 });
+    setBusy(false);
+    CODES_AT = Date.now();
+    if (r.ok && r.person) {
+      setSaved(r.person);
+      setF(pick(r.person));
+      onSaved(r.person);
+      setMsg(fresh && !saved ? "Added. Now send them their code." : "Saved.");
+    } else setMsg(r.reason || "Couldn't save.");
+  };
+  const remove = async () => {
+    setBusy(true);
+    const r = await people.remove(saved.id);
+    setBusy(false);
+    if (r.ok) onRemoved(saved.id);
+    else setMsg(r.reason || "Couldn't remove them.");
+  };
+  const p = { ...person || {}, ...saved || {} };
+  const off = f.status === "paused" || expired(f.access_end);
+  const liveOff = !!saved && (saved.status === "paused" || expired(saved.access_end));
+  const unsavedCode = !!saved && (f.code || "").trim() !== (saved.code || "");
+  const send = async () => {
+    const m = await sendCodeTo(saved, names.title);
+    setSendMsg(m);
+    if (m) setTimeout(() => setSendMsg(""), 2600);
+  };
+  const groups = useMemo(() => {
+    const out = [];
+    let last = null;
+    const evs = use && use.events || [];
+    evs.forEach((ev, i) => {
+      const newer = evs[i - 1], older = evs[i + 1];
+      if (ev.event === "back" && older && older.event === "close" && older.session === ev.session && new Date(ev.at) - new Date(older.at) < 12e4) return;
+      if (ev.event === "close" && newer && newer.event === "back" && newer.session === ev.session && new Date(newer.at) - new Date(ev.at) < 12e4) return;
+      const key = describe(ev);
+      if (last && last.key === key && last.session === ev.session) return;
+      const d = new Date(ev.at), dayKey = d.toDateString();
+      let g = out[out.length - 1];
+      if (!g || g.dayKey !== dayKey) {
+        g = { dayKey, date: d, items: [] };
+        out.push(g);
+      }
+      g.items.push({ key, time: d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).toLowerCase(), ev });
+      last = { key, session: ev.session };
+    });
+    return out;
+  }, [use]);
+  const dayName = (g) => {
+    const diff = Math.round((new Date((/* @__PURE__ */ new Date()).toDateString()) - new Date(g.dayKey)) / 864e5);
+    return diff === 0 ? "Today" : diff === 1 ? "Yesterday" : g.date.toLocaleDateString([], { weekday: "long", month: "short", day: "numeric" });
+  };
+  const header = /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: onBack }, "\u2039 Everyone")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 14, alignItems: "center", marginBottom: 16 } }, /* @__PURE__ */ React.createElement(Initial, { name: f.name, role: f.role, size: 54 }), /* @__PURE__ */ React.createElement("div", { style: { minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `400 28px/1.15 ${F}`, color: C.ink, overflow: "hidden", textOverflow: "ellipsis" } }, f.name.trim() || (fresh && !saved ? "New person" : "Unnamed")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center", marginTop: 4, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(RoleTag, { role: f.role }), saved && /* @__PURE__ */ React.createElement("span", { style: { font: `italic 15px ${F}`, color: liveOff ? C.tomato : hereNow(p) ? C.sageDeep : C.soft } }, saved.status === "paused" ? "paused" : expired(saved.access_end) ? `ended ${untilLabel(saved.access_end)}` : hereNow(p) ? "here now" : p.last_seen ? `here ${ago(p.last_seen)}` : "hasn't come in yet")))));
+  const sendBox = saved && /* @__PURE__ */ React.createElement("div", { className: "bb-rise", style: { background: C.blush, borderRadius: 12, padding: 14, marginBottom: 22 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `16px/1.45 ${F}`, color: C.ink, marginBottom: 10 } }, liveOff ? "Their code is switched off right now." : unsavedCode ? "Save first, then send the new code." : /* @__PURE__ */ React.createElement(React.Fragment, null, "Their code is ", /* @__PURE__ */ React.createElement("b", { style: { fontWeight: 500, letterSpacing: "0.02em" } }, saved.code), ". The link logs them straight in, on any phone or computer, and keeps them in.")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement(Btn, { small: true, onClick: send, disabled: liveOff || unsavedCode }, "Send link"), !liveOff && !unsavedCode && /* @__PURE__ */ React.createElement(CopyBtn, { text: () => codeLink(whoOfRole(saved.role), saved.code) }, "Copy link"), !liveOff && !unsavedCode && /* @__PURE__ */ React.createElement(CopyBtn, { text: () => codeText(whoOfRole(saved.role), saved.code) }, "Copy code"), sendMsg && /* @__PURE__ */ React.createElement("span", { className: "bb-rise", style: { font: `italic 14px ${F}`, color: C.sageDeep } }, sendMsg)));
+  const useBlock = saved && /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 6 } }, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, "Use"), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(118px, 1fr))", gap: 8, marginBottom: 16 } }, /* @__PURE__ */ React.createElement(Tile, { label: "Last here", value: hereNow(p) ? "now" : p.last_seen ? ago(p.last_seen) : "not yet", sub: p.device || null }), /* @__PURE__ */ React.createElement(Tile, { label: "Visits", value: String(p.visits || 0), sub: `${p.visits_week || 0} this week` }), /* @__PURE__ */ React.createElement(Tile, { label: "Time here", value: hours(p.minutes) }), /* @__PURE__ */ React.createElement(Tile, { label: "Orders", value: String(p.orders || 0) })), !use ? /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.soft, marginBottom: 20 } }, "Fetching their visits\u2026") : /* @__PURE__ */ React.createElement("div", { className: "bb-view" }, /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 20 } }, /* @__PURE__ */ React.createElement(VisitDays, { days: use.days || [] })), /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 6 } }, "What they did"), groups.length === 0 ? /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.soft, marginBottom: 20 } }, "Nothing yet. It shows up here once they come in.") : /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 20 } }, groups.slice(0, 10).map((g) => /* @__PURE__ */ React.createElement("div", { key: g.dayKey, style: { marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `500 15px ${F}`, color: C.ink, margin: "6px 0 4px" } }, dayName(g)), /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 0 } }, g.items.slice(0, 40).map((it, i) => /* @__PURE__ */ React.createElement("div", { key: i, style: { display: "flex", gap: 12, padding: "5px 0", borderBottom: `1px solid ${C.hair}`, alignItems: "baseline" } }, /* @__PURE__ */ React.createElement("span", { style: { width: 66, flexShrink: 0, font: `14px ${F}`, color: C.soft, textAlign: "right" } }, it.time), /* @__PURE__ */ React.createElement("span", { style: { flex: 1, minWidth: 0, font: `16px/1.4 ${F}`, color: it.ev.event === "order" ? C.tomatoDeep : C.ink } }, it.key)))))))));
+  const details = /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 12, marginBottom: 18 } }, saved && /* @__PURE__ */ React.createElement(Caps, null, "Details"), /* @__PURE__ */ React.createElement(Field, { value: f.name, onChange: (e) => set("name", e.target.value.slice(0, 40)), placeholder: "Name", "aria-label": "Name" }), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement(Chip, { active: f.role === "home", onClick: () => set("role", "home") }, "Home"), /* @__PURE__ */ React.createElement(Chip, { active: f.role === "guest", onClick: () => set("role", "guest") }, "Guest"), /* @__PURE__ */ React.createElement("span", { style: { font: `italic 14.5px/1.4 ${F}`, color: C.soft } }, f.role === "home" ? "the full menu, the fridge and the arcade" : "the guest menu")), /* @__PURE__ */ React.createElement("div", { style: { display: "grid", gap: 6 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `16px ${F}`, color: C.soft } }, "Kitchen code"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6 } }, /* @__PURE__ */ React.createElement(Field, { value: f.code, onChange: (e) => set("code", e.target.value), "aria-label": "Kitchen code", autoCapitalize: "off", autoCorrect: "off", spellCheck: false, style: { minWidth: 0 } }), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => set("code", freshCode()), style: { padding: "8px 10px", whiteSpace: "nowrap" } }, "New"))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { font: `16px ${F}`, color: C.soft } }, "Open until"), /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      type: "date",
+      value: f.access_end || "",
+      onChange: (e) => set("access_end", e.target.value),
+      "aria-label": "Open until",
+      style: { font: `16px ${F}`, color: C.ink, background: C.parch, border: `1px solid ${C.line}`, borderRadius: 10, padding: "7px 10px" }
+    }
+  ), f.access_end ? /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => set("access_end", ""), style: { padding: "6px 10px" } }, "No end") : /* @__PURE__ */ React.createElement("span", { style: { font: `italic 15px ${F}`, color: C.soft } }, "no end date")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement(Chip, { active: f.status === "active", onClick: () => set("status", "active") }, "Active"), /* @__PURE__ */ React.createElement(Chip, { active: f.status === "paused", onClick: () => set("status", "paused") }, "Paused"), off && /* @__PURE__ */ React.createElement("span", { style: { font: `italic 14.5px ${F}`, color: C.soft } }, f.status === "paused" ? "their code won't open the kitchen" : "past the end date")), /* @__PURE__ */ React.createElement(
+    "textarea",
+    {
+      value: f.notes,
+      onChange: (e) => set("notes", e.target.value.slice(0, 600)),
+      placeholder: "Notes, for you only",
+      "aria-label": "Notes",
+      rows: 2,
+      style: { font: `16px/1.5 ${F}`, color: C.ink, background: C.parch, border: `1px solid ${C.line}`, borderRadius: 10, padding: "9px 12px", resize: "vertical" }
+    }
+  ), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Btn, { small: true, onClick: save, disabled: busy || !dirty }, busy ? "Saving\u2026" : saved ? "Save" : "Add"), msg && /* @__PURE__ */ React.createElement("span", { className: "bb-rise", style: { font: `italic 15px ${F}`, color: /^(Saved|Added)/.test(msg) ? C.sageDeep : C.tomato } }, msg)));
+  const removeBlock = saved && /* @__PURE__ */ React.createElement("div", { style: { borderTop: `1px solid ${C.hair}`, paddingTop: 14, marginBottom: 8 } }, sure ? /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" } }, /* @__PURE__ */ React.createElement("span", { style: { font: `15px ${F}`, color: C.ink } }, "Their code stops working and their history goes."), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "danger", onClick: remove, disabled: busy }, "Remove ", f.name.trim() || "them"), /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => setSure(false) }, "Keep")) : /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: () => setSure(true), style: { color: C.soft } }, "Remove ", f.name.trim() || "this person"));
+  return /* @__PURE__ */ React.createElement("div", { ref: top, className: "bb-view" }, header, saved ? /* @__PURE__ */ React.createElement(React.Fragment, null, sendBox, useBlock, details, removeBlock) : details);
+}
+function People({ open, setOpen, onLegacy, update }) {
+  const [list, setList] = useState(null);
+  const [err, setErr] = useState("");
+  const load = async () => {
+    const r = await people.list();
+    if (r.ok) {
+      setList(r.people || []);
+      setErr("");
+    } else if (r.kind === "setup") onLegacy();
+    else setErr(r.error || "Couldn't fetch everyone just now.");
+  };
+  useEffect(() => {
+    load();
+    const iv = setInterval(() => {
+      if (!document.hidden) load();
+    }, 3e4);
+    return () => clearInterval(iv);
+  }, []);
+  if (open) {
+    const person = open === "new" ? null : (list || []).find((p) => p.id === open);
+    return /* @__PURE__ */ React.createElement(
+      PersonPage,
+      {
+        key: open,
+        person,
+        onBack: () => {
+          setOpen(null);
+          load();
+        },
+        onSaved: (p) => {
+          const homes = (list || []).filter((q) => q.role === "home");
+          if (p.role === "home" && p.name && (!homes.length || homes[0].id === p.id)) update((d) => ((d.settings || {}).names || {}).bran === p.name ? d : { ...d, settings: { ...d.settings || {}, names: { ...(d.settings || {}).names || {}, bran: p.name } } });
+          setList((l) => {
+            const x = l || [];
+            const i = x.findIndex((q) => q.id === p.id);
+            const merged = { ...i >= 0 ? x[i] : {}, ...p };
+            return i >= 0 ? x.map((q, j) => j === i ? merged : q) : [...x, merged];
+          });
+        },
+        onRemoved: (id) => {
+          setList((l) => (l || []).filter((q) => q.id !== id));
+          setOpen(null);
+        }
+      }
+    );
+  }
+  return /* @__PURE__ */ React.createElement(PeopleList, { list, err, onOpen: setOpen, onNew: () => setOpen("new") });
+}
+function CookPassword() {
+  const names = useNames();
+  const [pw, setPw] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const save = async () => {
+    const next = pw.trim();
+    if (!next) return;
+    setBusy(true);
+    CODES_AT = Date.now();
+    const r = await store.setPasswords({ mayu: next });
+    setBusy(false);
+    CODES_AT = Date.now();
+    if (r.ok) {
+      SESSION = { ...SESSION, pass: next };
+      setPw("");
+      setMsg("Saved.");
+    } else setMsg(r.reason || "Couldn't save.");
+  };
+  return /* @__PURE__ */ React.createElement("div", { style: { marginBottom: 22 } }, /* @__PURE__ */ React.createElement(Caps, { style: { marginBottom: 8 } }, names.mayu, "'s password"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center" } }, /* @__PURE__ */ React.createElement(SecretField, { value: pw, onChange: (v) => {
+    setPw(v);
+    setMsg("");
+  }, onEnter: save, placeholder: "A new password" }), /* @__PURE__ */ React.createElement(Btn, { small: true, onClick: save, disabled: busy || !pw.trim() }, busy ? "Saving\u2026" : "Change")), msg && /* @__PURE__ */ React.createElement("div", { className: "bb-rise", style: { font: `italic 15px ${F}`, color: msg === "Saved." ? C.sageDeep : C.tomato, marginTop: 6 } }, msg));
+}
+function PeopleRoom({ data, update }) {
+  const [legacy, setLegacy] = useState(() => !store.cloud());
+  const [open, setOpen] = useState(null);
+  if (legacy) return /* @__PURE__ */ React.createElement(Codes, { data, update });
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(People, { open, setOpen, onLegacy: () => setLegacy(true), update }), !open && /* @__PURE__ */ React.createElement(CookPassword, null));
 }
 function Week({ data, update }) {
   const on = new Set(data.menu);
@@ -4508,6 +5063,9 @@ function FridgeLook({ data, update, back, sound, who }) {
   const shelves = door === "fridge" ? [["fridge", ""]] : door === "freezer" ? [["freezer", ""]] : [["pantry", "Pantry"], ["snacks", "Snacks"]];
   const [nudge, setNudge] = useState(0);
   const fill = (k) => door === k ? `url(#${g}lit)` : `url(#${g}door)`;
+  useEffect(() => {
+    if (door) track("view", { screen: door });
+  }, [door]);
   return /* @__PURE__ */ React.createElement("div", { className: "bb-view" }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 14 } }, /* @__PURE__ */ React.createElement(Btn, { small: true, tone: "ghost", onClick: back }, "\u2039 Back"), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, textAlign: "center", font: `400 22px ${F}`, color: C.ink } }, "The Fridge"), /* @__PURE__ */ React.createElement("span", { style: { width: 74 } })), /* @__PURE__ */ React.createElement(Panel, null, /* @__PURE__ */ React.createElement(PetStage, { napShift: 0.19, sound, animals: data.animals, plants: data.plants || [], onPlants: () => setPlantsOpen(true), treat: { cat: !!data.catTreat, dog: !!data.dogTreat, dogTreats: data.dogTreats || [] }, onTreat: (k, name) => update((p) => k === "cookie" ? { ...p, dogTreats: (() => {
     const l = [...p.dogTreats || []];
     const i = l.findIndex((n) => n === "*" || name && n.toLowerCase() === name.toLowerCase());
@@ -4613,6 +5171,7 @@ function ArcadeGame({ onExit, sound, data, update, player }) {
       if (s2 === "title") {
         e.start(now.current.sel);
         go("play");
+        track("view", { screen: "game" });
       } else if (s2 === "over") {
         e.retry();
         go("play");
@@ -4636,10 +5195,12 @@ function ArcadeGame({ onExit, sound, data, update, player }) {
             const next = { ...a, stars: stars2, unlocked: Math.max(a.unlocked || 1, Math.min(total, d.stage + 2)) };
             return d.last ? record({ ...next, won: true }, d, true) : next;
           });
+          if (d.last) track("arcade", { stage: d.stage + 1, score: d.score, won: true });
           go(d.last ? "won" : "tally", { tally: d });
         } else if (name === "over") {
           save((a) => record(a, d, false));
           go("over", { score: d.score, stage: d.stage });
+          track("arcade", { stage: d.stage + 1, score: d.score, won: false });
         } else if (name === "pausekey") {
           if (s2 === "play") {
             e.pause(true);
@@ -4781,6 +5342,7 @@ function MealWheel({ onExit, sound, data, canOrder, onPick }) {
       setSpinning(false);
       setPick(pool[idx]);
       if (sound && sound.ping) sound.ping();
+      track("wheel", { dish: (pool[idx] || {}).name || "" });
     }, 4300);
   };
   const R = 150, cx = 160, cy = 160;
@@ -4816,6 +5378,9 @@ function ArcadeRoom({ onExit, sound, data, update, player, canOrder, onPick }) {
       setZoom(null);
     }, 520);
   };
+  useEffect(() => {
+    if (open && open !== "cat") track("view", { screen: "wheel" });
+  }, [open]);
   if (open) {
     return /* @__PURE__ */ React.createElement("div", { className: "bb-zoomin" }, open === "cat" ? /* @__PURE__ */ React.createElement(ArcadeGame, { onExit: () => setOpen(null), sound, data, update, player }) : /* @__PURE__ */ React.createElement(MealWheel, { onExit: () => setOpen(null), sound, data, canOrder, onPick }));
   }
@@ -4850,6 +5415,8 @@ function MenuHead({ title, note, accent }) {
 function Diner({ data, update, out, mode, sound }) {
   const guest = mode === "guest";
   const names = useNames();
+  const me = useMe();
+  const myName = nameOf(me) || (guest ? "Guest" : names.bran);
   const [cart, setCart] = useState([]);
   const [customizing, setCustomizing] = useState(null);
   const [dishOpt, setDishOpt] = useState(null);
@@ -4860,6 +5427,9 @@ function Diner({ data, update, out, mode, sound }) {
   const [cravingSent, setCravingSent] = useState(false);
   const [looking, setLooking] = useState(false);
   const [arcade, setArcade] = useState(false);
+  useEffect(() => {
+    track("view", { screen: arcade ? "arcade" : looking ? "fridge" : tab === "drink" ? "drinks" : "food" });
+  }, [tab, looking, arcade]);
   const inv = data.inventory;
   const menuSet = new Set(data.menu);
   const ev = resolveEvent(data.event);
@@ -4912,7 +5482,8 @@ function Diner({ data, update, out, mode, sound }) {
   };
   const sendCraving = () => {
     if (!craving.trim()) return;
-    update((p) => ({ ...p, cravings: [...p.cravings, { id: uid(), text: craving.trim(), done: false, at: Date.now(), updatedAt: Date.now() }] }));
+    update((p) => ({ ...p, cravings: [...p.cravings, { id: uid(), text: craving.trim(), by: nameOf(me) || void 0, done: false, at: Date.now(), updatedAt: Date.now() }] }));
+    track("craving", { text: craving.trim().slice(0, 140) });
     sound.ping();
     setCraving("");
     setCravingSent(true);
@@ -4922,12 +5493,12 @@ function Diner({ data, update, out, mode, sound }) {
     setSent(null);
     setCart([]);
   } });
-  if (arcade) return /* @__PURE__ */ React.createElement("div", { className: "bb-view" }, /* @__PURE__ */ React.createElement(Bar, { label: names.bran, out }), /* @__PURE__ */ React.createElement(ArcadeRoom, { onExit: () => setArcade(false), sound, data, update, player: names.bran, canOrder, onPick: (r) => {
+  if (arcade) return /* @__PURE__ */ React.createElement("div", { className: "bb-view" }, /* @__PURE__ */ React.createElement(Bar, { label: myName, out }), /* @__PURE__ */ React.createElement(ArcadeRoom, { onExit: () => setArcade(false), sound, data, update, player: myName, canOrder, onPick: (r) => {
     addDish(r);
     setArcade(false);
   } }));
-  if (looking) return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Bar, { label: guest ? "Guest" : names.bran, out }), /* @__PURE__ */ React.createElement(FridgeLook, { data, update, sound, who: mode, back: () => setLooking(false) }));
-  return /* @__PURE__ */ React.createElement(ThemeCtx.Provider, { value: ev }, /* @__PURE__ */ React.createElement("div", { style: { paddingBottom: cart.length ? 96 : 0 } }, /* @__PURE__ */ React.createElement("div", { className: "bb-stagger" }, /* @__PURE__ */ React.createElement(Bar, { label: guest ? "Guest" : names.bran, out }), /* @__PURE__ */ React.createElement(Panel, { ornate: true }, /* @__PURE__ */ React.createElement(EventBanner, { ev }), /* @__PURE__ */ React.createElement(Caps, { style: { textAlign: "center" } }, (/* @__PURE__ */ new Date()).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })), /* @__PURE__ */ React.createElement(Title, { size: 34 }, "Menu"), /* @__PURE__ */ React.createElement(Divider, null), !guest && freshest.length > 0 && /* @__PURE__ */ React.createElement(Sub, null, "Freshest today \u2014 ", freshest.join(", ")), (data.menuNote || "").trim() && /* @__PURE__ */ React.createElement(Sub, null, data.menuNote), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", alignItems: "center", gap: 8, marginTop: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Chip, { active: tab === "food", onClick: () => setTab("food") }, "Food"), /* @__PURE__ */ React.createElement(Chip, { active: tab === "drink", onClick: () => setTab("drink") }, "Drinks"), !guest && /* @__PURE__ */ React.createElement(
+  if (looking) return /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(Bar, { label: myName, out }), /* @__PURE__ */ React.createElement(FridgeLook, { data, update, sound, who: mode, back: () => setLooking(false) }));
+  return /* @__PURE__ */ React.createElement(ThemeCtx.Provider, { value: ev }, /* @__PURE__ */ React.createElement("div", { style: { paddingBottom: cart.length ? 96 : 0 } }, /* @__PURE__ */ React.createElement("div", { className: "bb-stagger" }, /* @__PURE__ */ React.createElement(Bar, { label: myName, out }), /* @__PURE__ */ React.createElement(Panel, { ornate: true }, /* @__PURE__ */ React.createElement(EventBanner, { ev }), /* @__PURE__ */ React.createElement(Caps, { style: { textAlign: "center" } }, (/* @__PURE__ */ new Date()).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })), /* @__PURE__ */ React.createElement(Title, { size: 34 }, "Menu"), /* @__PURE__ */ React.createElement(Divider, null), !guest && freshest.length > 0 && /* @__PURE__ */ React.createElement(Sub, null, "Freshest today \u2014 ", freshest.join(", ")), (data.menuNote || "").trim() && /* @__PURE__ */ React.createElement(Sub, null, data.menuNote), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", justifyContent: "center", alignItems: "center", gap: 8, marginTop: 14, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement(Chip, { active: tab === "food", onClick: () => setTab("food") }, "Food"), /* @__PURE__ */ React.createElement(Chip, { active: tab === "drink", onClick: () => setTab("drink") }, "Drinks"), !guest && /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: () => setLooking(true),
@@ -4989,6 +5560,7 @@ function Diner({ data, update, out, mode, sound }) {
     setCustomizing(null);
   } }), reviewing && /* @__PURE__ */ React.createElement(Review, { cart, data, mode, guest, sound, close: () => setReviewing(false), removeAt: (k) => setCart(cart.filter((c) => c.key !== k)), onSend: (p) => {
     update(p.apply);
+    track("order", p.track);
     setReviewing(false);
     setSent(p.receipt);
   } })));
@@ -5027,9 +5599,10 @@ function Customize({ state, data, close, add }) {
   })), o.milk !== "none" && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10 } }, /* @__PURE__ */ React.createElement(Chip, { active: o.froth, onClick: () => set("froth", !o.froth) }, o.froth ? "Frothed" : "Froth it"))), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 24, display: "flex", gap: 10, alignItems: "center" } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, font: `italic 16px ${F}`, color: C.soft } }, "About ", mins(d.prep + (icedTea ? ICED_LEAD : 0) + (hot && d.kind === "cold" ? 3 : 0))), /* @__PURE__ */ React.createElement(SheetCancel, null), /* @__PURE__ */ React.createElement(Btn, { onClick: () => add(o) }, "Add")));
 }
 function Review({ cart, data, mode, guest, close, removeAt, onSend, sound }) {
+  const me = useMe();
   const [timing, setTiming] = useState("asap");
   const [when, setWhen] = useState("");
-  const [name, setName] = useState("");
+  const [name, setName] = useState(() => guest && nameOf(me) || "");
   const [note, setNote] = useState("");
   const t = cartTotals(cart, data);
   const whenLabel = timing === "asap" ? `as soon as possible, about ${clock(t.at)}` : timing === "later" ? `later today${when ? `, ${when}` : ""}` : `another day${when ? `, ${when}` : ""}`;
@@ -5042,9 +5615,10 @@ function Review({ cart, data, mode, guest, close, removeAt, onSend, sound }) {
       apply: (p) => ({
         ...p,
         history: [...p.history || [], batch],
-        requests: [...p.requests, ...cart.map((it) => ({ id: uid(), from: mode, guestName: name.trim(), recipeId: it.type === "dish" ? it.id : void 0, drinkId: it.type === "drink" ? it.id : void 0, custom: sub(it), qty: it.qty || 1, whenLabel, note: note.trim(), done: false, at: Date.now(), updatedAt: Date.now() }))]
+        requests: [...p.requests, ...cart.map((it) => ({ id: uid(), from: mode, guestName: name.trim(), by: nameOf(me) || void 0, pid: me ? me.id : void 0, recipeId: it.type === "dish" ? it.id : void 0, drinkId: it.type === "drink" ? it.id : void 0, custom: sub(it), qty: it.qty || 1, whenLabel, note: note.trim(), done: false, at: Date.now(), updatedAt: Date.now() }))]
       }),
-      receipt: { count: cart.length, whenLabel, shop: t.shop > 0 && !guest, total: t.total, name: name.trim() }
+      receipt: { count: cart.length, whenLabel, shop: t.shop > 0 && !guest, total: t.total, name: name.trim() },
+      track: { items: cart.map(label).filter((x) => x && !/^undefined/.test(x)).slice(0, 12), n: cart.reduce((n, c) => n + (c.qty || 1), 0) }
     }), 950);
   };
   return /* @__PURE__ */ React.createElement(Sheet, { onClose: close, tall: true }, /* @__PURE__ */ React.createElement(Title, { size: 28 }, "Your Order"), /* @__PURE__ */ React.createElement(Divider, { w: 36 }), /* @__PURE__ */ React.createElement("div", { className: "bb-list", style: { display: "grid", gap: 10 } }, cart.map((it) => /* @__PURE__ */ React.createElement("div", { key: it.key, style: { display: "flex", gap: 10, alignItems: "center", background: C.parchWell, borderRadius: 10, padding: 13 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { font: `500 18px ${F}` } }, label(it)), sub(it) && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 15px ${F}`, color: C.roseDeep } }, sub(it)), /* @__PURE__ */ React.createElement("div", { style: { font: `15px ${F}`, color: C.soft } }, mins(itemMinutes(it, data)))), /* @__PURE__ */ React.createElement("button", { onClick: () => removeAt(it.key), style: { ...stepBtn, color: C.soft } }, "\xD7")))), /* @__PURE__ */ React.createElement("div", { style: { background: C.parchWell, borderRadius: 10, padding: 14, marginTop: 14 } }, [["Cooking", mins(t.cookSum)], ["Plating", mins(t.handling)]].concat(t.shop && !guest ? [["Shopping first", mins(t.shop)]] : []).map(([k, v]) => /* @__PURE__ */ React.createElement("div", { key: k, style: { display: "flex", justifyContent: "space-between", font: `16px ${F}`, color: C.soft, marginBottom: 6 } }, /* @__PURE__ */ React.createElement("span", null, k), /* @__PURE__ */ React.createElement("span", null, v))), /* @__PURE__ */ React.createElement("div", { style: { borderTop: `1px solid ${C.line}`, marginTop: 8, paddingTop: 10, display: "flex", justifyContent: "space-between", font: `500 19px ${F}` } }, /* @__PURE__ */ React.createElement("span", null, "Estimated total"), /* @__PURE__ */ React.createElement("span", null, mins(t.total))), timing === "asap" && /* @__PURE__ */ React.createElement("div", { style: { font: `italic 16px ${F}`, color: C.soft, marginTop: 6 } }, "Ready around ", clock(t.at))), /* @__PURE__ */ React.createElement(Caps, { style: { margin: "20px 0 8px" } }, "When"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } }, [["asap", "As soon as possible"], ["later", "Later today"], ["day", "Another day"]].map(([k, l]) => /* @__PURE__ */ React.createElement(Chip, { key: k, active: timing === k, onClick: () => setTiming(k) }, l))), timing !== "asap" && /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10 } }, /* @__PURE__ */ React.createElement(Field, { placeholder: timing === "later" ? "What time?" : "Which day and time?", value: when, onChange: (e) => setWhen(e.target.value) })), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 16, display: "grid", gap: 10 } }, guest && /* @__PURE__ */ React.createElement(Field, { placeholder: "Your name", value: name, onChange: (e) => setName(e.target.value) }), /* @__PURE__ */ React.createElement(Field, { placeholder: guest ? "Allergies or preferences" : "A note for the kitchen", value: note, onChange: (e) => setNote(e.target.value) })), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 22 } }, /* @__PURE__ */ React.createElement(ServiceBell, { onRing: send, label: "Ring for service" })));
